@@ -39,10 +39,14 @@ they are unavailable.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import re
 import logging
+
+from .llm_client import BailianQwenClient
+from .llm_types import FourTierCandidate
+from .prompts import PROFILE_SEMANTIC_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +102,8 @@ class ProfileSemanticAgent:
     def __init__(
         self,
         institution_domain_map: Optional[Dict[str, str]] = None,
+        llm_client: Optional[BailianQwenClient] = None,
+        use_llm: bool = True,
     ) -> None:
         """Create a new ProfileSemanticAgent.
 
@@ -111,6 +117,51 @@ class ProfileSemanticAgent:
             heuristic.
         """
         self.institution_domain_map = institution_domain_map or {}
+        self.llm_client = llm_client
+        self.use_llm = use_llm
+
+
+    def infer_llm(self, login: str, name: Optional[str] = None,
+                  email: Optional[str] = None, text: Optional[str] = None,
+                  org: Optional[str] = None, location: Optional[str] = None,
+                  cleaned_location_mentions: Optional[List[str]] = None) -> List[FourTierCandidate]:
+        """Generate profile-semantic candidates with Qwen via Bailian/DashScope.
+
+        This method implements the paper's role-specific prompt and structured
+        output schema for A_sem. If no LLM client is configured, it falls back to
+        the deterministic heuristic `infer` method and wraps its outputs as
+        coarse four-tier candidates.
+        """
+        if not self.use_llm or self.llm_client is None:
+            fallback = self.infer(login, name=name, email=email, text=text, org=org)
+            return [
+                FourTierCandidate(country=c.location, confidence=c.score, evidence=[c.evidence], agent="A_sem")
+                for c in fallback
+            ]
+
+        payload = {
+            "developer": {
+                "login": login,
+                "name": name,
+                "email": email,
+                "organization": org,
+                "self_reported_location": location,
+                "profile_text": text,
+                "cleaned_location_mentions": cleaned_location_mentions or [],
+            },
+            "institution_domain_map_hit": self._lookup_domain(email),
+        }
+        result = self.llm_client.chat_json(PROFILE_SEMANTIC_PROMPT, payload)
+        return [
+            FourTierCandidate.from_dict(item, agent="A_sem")
+            for item in result.get("candidates", [])
+        ]
+
+    def _lookup_domain(self, email: Optional[str]) -> Optional[str]:
+        if not email or "@" not in email:
+            return None
+        domain = email.split("@", 1)[1].lower()
+        return self.institution_domain_map.get(domain)
 
     def infer(self, login: str, name: Optional[str] = None,
               email: Optional[str] = None, text: Optional[str] = None,

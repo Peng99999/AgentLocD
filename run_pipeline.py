@@ -56,11 +56,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the AgentLocD pipeline on a sample of developers.")
     parser.add_argument("--limit", type=int, default=50, help="Number of developers to process")
     parser.add_argument("--output", type=str, default="agentlocd_predictions.csv", help="CSV output filename")
+    parser.add_argument("--no-llm", action="store_true", help="Disable LLM calls and use deterministic fallback")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     # Instantiate pipeline with default settings
-    pipeline = AgentLocDPipeline()
+    pipeline = AgentLocDPipeline(use_llm=not args.no_llm)
     # Fetch sample developers
     developers = fetch_sample_developers(limit=args.limit)
     logging.info("Fetched %d developers", len(developers))

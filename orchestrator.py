@@ -1,121 +1,148 @@
-"""Implementation of the AgentLocD orchestrator.
+"""AgentLocD orchestrator with Free-MAD style LLM arbitration.
 
-The orchestrator coordinates the three evidence agents, combines
-candidate locations, and applies the Free-MAD arbitration mechanism
-with graceful degradation.  In the full AgentLocD paper the
-Free‑MAD algorithm performs multi‑round debate among agents to
-resolve conflicts at each spatial tier.  For the purposes of this
-reference implementation we provide a simplified arbitration
-procedure that still respects the reliability ordering of agents and
-demonstrates how the agents interact.
-
-The orchestrator proceeds as follows:
-
-1. Invoke the profile‑semantic, collaboration and temporal agents for
-   a given developer login to obtain candidate location sets and a
-   UTC offset range.
-2. Consolidate candidates by location string, summing scores where
-   both agents agree.
-3. Apply a reliability prior: collaboration candidates are preferred
-   over semantic candidates, and temporal constraints may prune
-   candidates whose UTC offset appears inconsistent (not implemented
-   in this simplified version because location strings are not tied
-   to offsets).
-4. Select the highest scoring candidate.  If no candidates are
-   available, return ``None`` indicating insufficient evidence.
-5. Return the selected candidate and the collected evidence traces.
-
-Note that this simplified orchestrator does not infer hierarchical
-location tiers; it merely produces a single best guess location
-string.  Developers wishing to replicate the full AgentLocD
-functionality should extend this class to handle multi‑level spatial
-hierarchies, implement a proper debate mechanism, and incorporate
-temporal pruning based on UTC offsets.
+The orchestrator receives structured candidate sets from A_sem, A_org and
+A_time, places them on a shared blackboard, and calls Qwen with an
+orchestrator prompt to perform debate-style arbitration. It then applies
+lightweight graceful degradation as a post-check to avoid unsupported lower-tier
+completion.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Dict
-
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
-from .profile_semantic_agent import ProfileSemanticAgent, Candidate as SemanticCandidate
-from .ecosystem_collaboration_agent import EcosystemCollaborationAgent, CollaborationCandidate
-from .spatiotemporal_constraint_agent import SpatiotemporalConstraintAgent, TimeConstraint
+from .ecosystem_collaboration_agent import EcosystemCollaborationAgent
+from .llm_client import BailianQwenClient
+from .llm_types import FourTierCandidate
+from .profile_semantic_agent import ProfileSemanticAgent
+from .prompts import ORCHESTRATOR_PROMPT
+from .spatiotemporal_constraint_agent import SpatiotemporalConstraintAgent
 
 logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """Coordinate evidence agents and produce final geolocation predictions."""
+    """Coordinate evidence agents and produce final four-tier predictions."""
 
     def __init__(
         self,
         semantic_agent: ProfileSemanticAgent,
         collaboration_agent: EcosystemCollaborationAgent,
         temporal_agent: SpatiotemporalConstraintAgent,
+        llm_client: Optional[BailianQwenClient] = None,
+        max_debate_rounds: int = 3,
+        use_llm: bool = True,
     ) -> None:
         self.semantic_agent = semantic_agent
         self.collaboration_agent = collaboration_agent
         self.temporal_agent = temporal_agent
+        self.llm_client = llm_client
+        self.max_debate_rounds = max_debate_rounds
+        self.use_llm = use_llm
 
-    def infer_location(self, actor_login: str, name: Optional[str] = None,
-                       email: Optional[str] = None, text: Optional[str] = None,
-                       org: Optional[str] = None) -> Tuple[Optional[str], Dict[str, float], Dict[str, str]]:
-        """Infer a developer's location using all agents.
+    def infer_location(
+        self,
+        actor_login: str,
+        name: Optional[str] = None,
+        email: Optional[str] = None,
+        text: Optional[str] = None,
+        org: Optional[str] = None,
+        location: Optional[str] = None,
+        cleaned_location_mentions: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Infer a four-tier spatial vector for one developer."""
+        sem_candidates = self.semantic_agent.infer_llm(
+            actor_login,
+            name=name,
+            email=email,
+            text=text,
+            org=org,
+            location=location,
+            cleaned_location_mentions=cleaned_location_mentions,
+        )
+        org_candidates = self.collaboration_agent.infer_llm(actor_login)
+        time_constraint = self.temporal_agent.infer_llm(actor_login)
 
-        Parameters
-        ----------
-        actor_login : str
-            Developer login for collaboration and temporal evidence lookup.
-        name, email, text, org : optional
-            Profile fields used by the semantic agent.
+        blackboard = {
+            "developer": {"login": actor_login},
+            "max_debate_rounds": self.max_debate_rounds,
+            "profile_semantic_candidates": [c.to_dict() for c in sem_candidates],
+            "collaboration_candidates": [c.to_dict() for c in org_candidates],
+            "temporal_constraint": time_constraint,
+        }
 
-        Returns
-        -------
-        Tuple[Optional[str], Dict[str, float], Dict[str, str]]
-            A tuple containing the selected location (or None), a
-            mapping from candidate locations to aggregated scores,
-            and a mapping from candidate locations to concatenated
-            evidence strings.
+        if self.use_llm and self.llm_client is not None:
+            decision = self.llm_client.chat_json(ORCHESTRATOR_PROMPT, blackboard)
+        else:
+            decision = self._fallback_arbitration(sem_candidates, org_candidates, time_constraint)
+
+        decision = self._apply_graceful_degradation(decision, sem_candidates, org_candidates)
+        decision["blackboard"] = blackboard
+        return decision
+
+    def _fallback_arbitration(
+        self,
+        sem_candidates: List[FourTierCandidate],
+        org_candidates: List[FourTierCandidate],
+        time_constraint: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Deterministic fallback when no LLM client is configured."""
+        candidates = sorted(
+            org_candidates + sem_candidates,
+            key=lambda c: (c.confidence, 1 if c.agent == "A_org" else 0),
+            reverse=True,
+        )
+        if not candidates:
+            return {
+                "country": None,
+                "state": None,
+                "city": None,
+                "locality": None,
+                "confidence": 0.0,
+                "decision_trace": ["No candidate returned by A_sem or A_org."],
+                "debate_rounds": [],
+            }
+        best = candidates[0]
+        return {
+            "country": best.country,
+            "state": best.state,
+            "city": best.city,
+            "locality": best.locality,
+            "confidence": best.confidence,
+            "decision_trace": [f"Fallback selected top candidate from {best.agent}: {best.rationale}"],
+            "debate_rounds": [],
+        }
+
+    def _apply_graceful_degradation(
+        self,
+        decision: Dict[str, Any],
+        sem_candidates: List[FourTierCandidate],
+        org_candidates: List[FourTierCandidate],
+    ) -> Dict[str, Any]:
+        """Post-check lower-tier outputs against semantic/collaboration evidence.
+
+        This is intentionally conservative: if a city or locality value appears
+        without any supporting semantic/collaboration candidate at that tier, it
+        is truncated to None along with lower tiers.
         """
-        # Collect evidence from each agent
-        sem_candidates = self.semantic_agent.infer(actor_login, name=name, email=email, text=text, org=org)
-        collab_candidates = self.collaboration_agent.infer(actor_login)
-        time_constraint = self.temporal_agent.infer(actor_login)
+        support = [c for c in sem_candidates + org_candidates]
 
-        # Consolidate candidates
-        scores: Dict[str, float] = {}
-        evidence: Dict[str, str] = {}
+        def supported(tier: str, value: Optional[str]) -> bool:
+            if value is None:
+                return True
+            return any(getattr(c, tier) == value for c in support)
 
-        # Add collaboration candidates first (higher priority)
-        for cand in collab_candidates:
-            loc = cand.location
-            scores[loc] = scores.get(loc, 0.0) + cand.score
-            evidence[loc] = evidence.get(loc, '') + f"collab({cand.evidence})"
-
-        # Add semantic candidates (lower priority) – only if not present or to boost existing
-        for cand in sem_candidates:
-            loc = cand.location
-            # If collab has already produced this location we'll still add the semantic score
-            scores[loc] = scores.get(loc, 0.0) + cand.score
-            ev_prev = evidence.get(loc, '')
-            sep = ';' if ev_prev else ''
-            evidence[loc] = ev_prev + sep + f"sem({cand.evidence})"
-
-        # Apply temporal constraint pruning (not fully implemented):
-        # In a complete implementation we would map each location to a
-        # time zone and remove candidates outside ``time_constraint``.
-        # Here we simply log the constraint for debugging.
-        if time_constraint:
-            logger.debug(
-                "Time constraint for %s: offset range %.2f to %.2f (evidence=%s)",
-                actor_login, time_constraint.offset_min, time_constraint.offset_max, time_constraint.evidence
-            )
-
-        if not scores:
-            return None, scores, evidence
-
-        # Select the highest scoring location
-        best_loc = max(scores, key=scores.get)
-        return best_loc, scores, evidence
+        if not supported("country", decision.get("country")):
+            decision.update({"country": None, "state": None, "city": None, "locality": None})
+            decision.setdefault("decision_trace", []).append("Graceful degradation removed unsupported country tier.")
+        elif not supported("state", decision.get("state")):
+            decision.update({"state": None, "city": None, "locality": None})
+            decision.setdefault("decision_trace", []).append("Graceful degradation removed unsupported state and lower tiers.")
+        elif not supported("city", decision.get("city")):
+            decision.update({"city": None, "locality": None})
+            decision.setdefault("decision_trace", []).append("Graceful degradation removed unsupported city and locality tiers.")
+        elif not supported("locality", decision.get("locality")):
+            decision.update({"locality": None})
+            decision.setdefault("decision_trace", []).append("Graceful degradation removed unsupported locality tier.")
+        return decision

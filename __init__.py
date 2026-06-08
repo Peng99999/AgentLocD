@@ -26,6 +26,8 @@ The package is organised into several modules:
 * ``spatiotemporal_constraint_agent``: implements the
   ``SpatiotemporalConstraintAgent``, which computes habitual UTC offset
   ranges from developers' activity timestamps.
+* ``llm_client`` and ``prompts``: wrap Alibaba Cloud Bailian/DashScope Qwen
+  calls and define role-specific prompts without storing API keys in code.
 * ``orchestrator``: coordinates the agents via the Free‑MAD debate
   mechanism, resolves conflicting evidence according to a reliability
   prior, and applies graceful degradation when sufficient evidence is

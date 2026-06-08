@@ -21,7 +21,7 @@ The returned range is expressed as a tuple ``(utc_offset_min, utc_offset_max)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 import pandas as pd
@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 import numpy as np
 
 from .db_utils import fetch_dataframe
+from .llm_client import BailianQwenClient
+from .prompts import TEMPORAL_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ class TimeConstraint:
 class SpatiotemporalConstraintAgent:
     """Estimate UTC offset ranges from timestamped activity logs."""
 
-    def __init__(self, epsilon_hours: float = 1.0) -> None:
+    def __init__(self, epsilon_hours: float = 1.0, llm_client: Optional[BailianQwenClient] = None, use_llm: bool = True) -> None:
         """Create a new SpatiotemporalConstraintAgent.
 
         Parameters
@@ -55,6 +57,34 @@ class SpatiotemporalConstraintAgent:
             final range will be ``(offset - epsilon, offset + epsilon)``.
         """
         self.epsilon = epsilon_hours
+        self.llm_client = llm_client
+        self.use_llm = use_llm
+
+
+    def infer_llm(self, actor_login: str) -> Optional[Dict[str, Any]]:
+        """Return an LLM-interpreted temporal constraint.
+
+        The UTC-offset range is calculated deterministically, then passed to
+        A_time's role-specific prompt so the model can produce warnings and a
+        structured temporal rationale.
+        """
+        constraint = self.infer(actor_login)
+        if constraint is None:
+            return None
+        payload = {
+            "actor_login": actor_login,
+            "utc_offset_range": [constraint.offset_min, constraint.offset_max],
+            "deterministic_evidence": constraint.evidence,
+        }
+        if not self.use_llm or self.llm_client is None:
+            return {
+                "agent": "A_time",
+                "utc_offset_range": [constraint.offset_min, constraint.offset_max],
+                "supported_longitudes": [],
+                "warnings": [],
+                "rationale": constraint.evidence,
+            }
+        return self.llm_client.chat_json(TEMPORAL_PROMPT, payload)
 
     def infer(self, actor_login: str) -> Optional[TimeConstraint]:
         """Estimate the UTC offset range for a developer.

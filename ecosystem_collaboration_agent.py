@@ -33,13 +33,16 @@ or mapping service.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import logging
 
 import pandas as pd
 
 from .db_utils import fetch_dataframe
+from .llm_client import BailianQwenClient
+from .llm_types import FourTierCandidate
+from .prompts import COLLABORATION_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +59,7 @@ class CollaborationCandidate:
 class EcosystemCollaborationAgent:
     """Compute candidate locations based on collaboration evidence and OpenRank."""
 
-    def __init__(self, max_anchors: int = 10) -> None:
+    def __init__(self, max_anchors: int = 10, llm_client: Optional[BailianQwenClient] = None, use_llm: bool = True) -> None:
         """Create a new EcosystemCollaborationAgent.
 
         Parameters
@@ -67,6 +70,43 @@ class EcosystemCollaborationAgent:
             values yield more candidates but increase query cost.
         """
         self.max_anchors = max_anchors
+        self.llm_client = llm_client
+        self.use_llm = use_llm
+
+
+    def infer_llm(self, actor_login: str) -> List[FourTierCandidate]:
+        """Generate collaboration candidates with Qwen via role-specific prompt.
+
+        Community OpenRank anchors are first retrieved deterministically from
+        OpenDigger; the LLM then interprets whether those anchors provide
+        geographic evidence and returns structured four-tier candidates.
+        """
+        community_df = self._fetch_core_anchors(actor_login)
+        anchors = community_df.to_dict(orient="records")
+        if not self.use_llm or self.llm_client is None:
+            fallback = self.infer(actor_login)
+            return [
+                FourTierCandidate(country=c.location, confidence=float(c.score), evidence=[c.evidence], agent="A_org")
+                for c in fallback
+            ]
+        payload = {"actor_login": actor_login, "openrank_anchors": anchors}
+        result = self.llm_client.chat_json(COLLABORATION_PROMPT, payload)
+        return [
+            FourTierCandidate.from_dict(item, agent="A_org")
+            for item in result.get("candidates", [])
+        ]
+
+    def _fetch_core_anchors(self, actor_login: str) -> pd.DataFrame:
+        community_query = """
+        SELECT
+            platform, repo_id, repo_name, org_id, org_login, actor_id, actor_login,
+            created_at, openrank, refined
+        FROM opensource.community_openrank
+        WHERE actor_login = %(actor)s
+        ORDER BY openrank DESC
+        LIMIT %(limit)s
+        """
+        return fetch_dataframe(community_query, params={"actor": actor_login, "limit": self.max_anchors})
 
     def infer(self, actor_login: str) -> List[CollaborationCandidate]:
         """Generate candidate locations for a developer based on collaboration evidence.
@@ -85,17 +125,7 @@ class EcosystemCollaborationAgent:
         # repositories and organisations where the actor is present and
         # order by OpenRank descending.  We limit the number of rows to
         # ``max_anchors`` to avoid overloading the query engine.
-        community_query = f"""
-        SELECT
-            org_login,
-            repo_name,
-            openrank
-        FROM opensource.community_openrank
-        WHERE actor_login = %(actor)s
-        ORDER BY openrank DESC
-        LIMIT %(limit)s
-        """
-        community_df = fetch_dataframe(community_query, params={"actor": actor_login, "limit": self.max_anchors})
+        community_df = self._fetch_core_anchors(actor_login)
 
         candidates: Dict[str, CollaborationCandidate] = {}
 
